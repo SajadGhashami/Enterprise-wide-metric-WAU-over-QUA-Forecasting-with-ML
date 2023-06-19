@@ -1,0 +1,237 @@
+---
+title: "WAU over QUA forecasting"
+output:
+  html_document:
+    code_folding: show
+    toc: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+## First specify the packages of interest
+packages = c("tidyverse", "timetk",
+             "modeltime", "lubridate", "DBI",
+             "tidymodels", "parsnip",  "rmarkdown", "knitr"  )
+
+## Now load or install&load all
+package.check <- lapply(
+  packages,
+  FUN = function(x) {
+    if (!require(x, character.only = TRUE)) {
+      install.packages(x, dependencies = TRUE)
+      library(x, character.only = TRUE)
+    }
+  }
+)
+
+
+```
+
+## Connecting to database and Pulling the data
+
+First we need to connect to database and pull the WAU/QUA for each day
+
+```{r mydata, message=TRUE, warning=TRUE}
+con <- DBI::dbConnect(odbc::odbc(),
+                      Driver       = "SnowflakeDSIIDriver",
+                      Server       = "ed87949.us-east-1.snowflakecomputing.com",
+                      UID          = rstudioapi::askForPassword("Database user"),
+                      PWD          = rstudioapi::askForPassword("Database password"),
+                      Database     = "EDW",
+                      Warehouse    = "INTEGRATE_LARGE_TEST",
+                      Schema       = "dim")
+mywh <- DBI::dbSendQuery(con, 'use role developer_role')
+mywh <- DBI::dbSendQuery(con, 'use warehouse INTEGRATE_LARGE_TEST')
+mydata <- DBI::dbGetQuery(con, "
+SELECT
+        'mydata' as id,
+        tdac.CENSUS_DATE,
+        sum(tdac.ACTIVE_LAST_7_DAYS_PAID_PRODUCT_SUBJECT_MATCH_ONLY) as WAU,
+        sum(tdac.ACTIVE_LAST_90_DAYS_PAID_PRODUCT_SUBJECT_MATCH_ONLY) as QUA,
+        nullif(sum(tdac.ACTIVE_LAST_7_DAYS_PAID_PRODUCT_SUBJECT_MATCH_ONLY)/sum(tdac.ACTIVE_LAST_90_DAYS_PAID_PRODUCT_SUBJECT_MATCH_ONLY),0) AS WAUOVERQUA
+        
+        FROM EDW.FACT.TEACHER_DAILY_ACTIVITY_COHORTS tdac
+
+        JOIN edw.fact.user_licenses ul
+             ON tdac.USER_KEY=ul.USER_KEY
+         AND tdac.CENSUS_DATE_KEY=ul.LICENSE_DATE_KEY
+        JOIN EDW.DIM.CALENDAR c
+             ON tdac.CENSUS_DATE_KEY = c.DATE_KEY
+WHERE  tdac.IS_PAID=1
+      AND  tdac.IS_TARGET_TEACHER=1
+AND ul.TEACHER_SUBJECT_PRODUCT_MATCH=1
+GROUP BY 1, 2
+ORDER BY CENSUS_DATE")
+dbDisconnect(con)
+```
+
+## How the Data Looks like
+```{r pressure, echo=FALSE}
+head(mydata) %>% kable()
+```
+
+### Summary of table
+
+```{r}
+mydata %>% summary() %>% kable()
+```
+
+### Ploting WAU/QUA per date
+
+```{r, out.width = '100%'}
+mydata <- mydata %>% 
+  select(ID, CENSUS_DATE, WAUOVERQUA)
+
+mydata %>%
+  plot_time_series(CENSUS_DATE, WAUOVERQUA, .interactive = TRUE, .color_var = year(CENSUS_DATE), .plotly_slider = TRUE)
+```
+
+## Modeling
+### Split data into train and test data
+
+```{r}
+splits <- initial_time_split(mydata, prop = 0.9)
+```
+
+### Building a prophet model
+
+```{r message=FALSE}
+model_fit_prophet <- prophet_reg() %>%
+  set_engine(engine = "prophet") %>%
+  fit(WAUOVERQUA ~ CENSUS_DATE, data = training(splits))
+models_tbl <- modeltime_table(model_fit_prophet)
+```
+
+### Run the model on test data
+
+```{r}
+calibration_tbl <- models_tbl %>%
+  modeltime_calibrate(new_data = testing(splits))
+```
+
+### Plot the test data forecast
+
+```{r, out.width = '100%'}
+calibration_tbl %>%
+  modeltime_forecast(
+    new_data    = testing(splits),
+    actual_data = mydata
+  ) %>%
+  plot_modeltime_forecast(
+    .legend_max_width = 25, # For mobile screens
+    .interactive= TRUE
+  )
+```
+
+### Model accuracy
+
+* MAE - Mean absolute error, [**mae**](https://en.wikipedia.org/wiki/Mean_absolute_error)
+
+* MAPE - Mean absolute percentage error, [**mape**](https://en.wikipedia.org/wiki/Mean_absolute_percentage_error)
+
+* MASE - Mean absolute scaled error, [**mase**](https://en.wikipedia.org/wiki/Mean_absolute_scaled_error)
+
+* SMAPE - Symmetric mean absolute percentage error, [**smape**](https://en.wikipedia.org/wiki/Symmetric_mean_absolute_percentage_error)
+
+* RMSE - Root mean squared error, [**rmse**](https://en.wikipedia.org/wiki/Root-mean-square_deviation)
+
+* RSQ - R-squared, [**rsq**](https://en.wikipedia.org/wiki/Coefficient_of_determination)
+
+```{r}
+calibration_tbl %>%
+  modeltime_accuracy() %>%
+  table_modeltime_accuracy(
+    .interactive = TRUE
+  )
+```
+
+### Refiiting the model
+
+```{r}
+refit_tbl <- calibration_tbl %>%
+  modeltime_refit(data = mydata)
+refit_tbl %>%
+   modeltime_accuracy() %>%
+  table_modeltime_accuracy(
+    .interactive = TRUE
+  )
+```
+
+### Forecast
+
+#### Finding the first and the Last day of the forecast
+
+First date is the last Data base date + 1 day and Last date is the last SY date If you want to predict next 3 year/month/days just simply replace **horizon** value with **"3 year"** or **"5 month"** or **"100 day"**
+
+```{r}
+DBlastday <- mydata %>% summarise(finalday= ymd(max(CENSUS_DATE))) %>% pull(finalday)
+next_march_year_offset <- if_else(month(DBlastday)>3,1,0)
+nextmarch <- ymd(paste(year(DBlastday)+next_march_year_offset, 3, 31))
+horizon <- as.double(difftime(nextmarch, DBlastday))
+
+```
+
+#### Predict future
+
+```{r, out.width = '100%'}
+forecasttable <- refit_tbl %>%
+  modeltime_forecast(h = horizon, actual_data = mydata)
+
+forecasttable %>% arrange(desc(.index)) %>% paged_table()
+
+forecasttable %>%
+  plot_modeltime_forecast(
+    .legend_max_width = 25, # For mobile screens
+    .interactive      = TRUE
+  )
+```
+
+## Writing predicted data into SNOWFLAKE
+
+### Add a new connection
+
+```{r message=TRUE, warning=TRUE}
+writecon <- DBI::dbConnect(odbc::odbc(),
+                      Driver       = "SnowflakeDSIIDriver",
+                      Server       = "ed87949.us-east-1.snowflakecomputing.com",
+                      UID          = rstudioapi::askForPassword("Database user"),
+                      PWD          = rstudioapi::askForPassword("Database password"),
+                      Database     = "ANALYTICS",
+                      Warehouse    = "COMPUTE_LARGE",
+                      Schema       = "SANDBOX")
+mywh <- DBI::dbSendQuery(writecon, 'use role ANALYST_ROLE')
+mywh <- DBI::dbSendQuery(writecon, 'use warehouse COMPUTE_LARGE')
+```
+
+### Prepare and Write data to SNOWFKALE  INTEGRATE_LARGE_TEST
+
+```{r}
+inserttable <- forecasttable %>%
+  filter(.key=="prediction") %>%
+  arrange(.index) %>%
+  mutate(SCHEDULE_DATE=today()) %>%
+  rename(MODEL_ID=.model_id, MODEL_NAME=.model_desc,
+         TYPE=.key, DATE=.index, VALUE=.value,
+         HI_CONF=.conf_hi, LO_CONF=.conf_lo) 
+table_id <- Id(schema = "SANDBOX", table = "forecast_wau_over_qua")
+head(inserttable)
+```
+
+table_id <- Id(schema = "SANDBOX", table = "FORECAST_WAU_OVER_QUA")
+```{r}
+# Write into snowflake
+
+dbWriteTable(writecon, table_id, inserttable, append=TRUE)
+
+# Read from data
+dbReadTable(writecon, table_id) %>% 
+  arrange(desc(SCHEDULE_DATE)) %>%
+  paged_table()
+
+# disconnect from the connection
+dbDisconnect(writecon)
+```
+
+
+
+
